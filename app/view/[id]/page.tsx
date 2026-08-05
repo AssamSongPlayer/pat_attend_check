@@ -300,6 +300,32 @@ export default function StudentViewPage({ params }: { params: Promise<{ id: stri
 
   const isSyncingRef = useRef(false);
   const datasetIdRef = useRef('');
+  const pendingRef = useRef<PendingMap>({});
+
+  // Keep pendingRef in sync
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  const flushPending = useCallback(async (id: string) => {
+    if (isSyncingRef.current || !navigator.onLine) return;
+    const entries = Object.entries(getPending(id));
+    if (!entries.length) return;
+    isSyncingRef.current = true;
+    setIsSyncing(true);
+    const newFailed: string[] = [];
+    for (const [recordId, changes] of entries) {
+      try {
+        await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
+        removePendingRecord(id, recordId);
+        setPending(prev => { const n = { ...prev }; delete n[recordId]; return n; });
+        setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
+      } catch { newFailed.push(recordId); }
+    }
+    saveFailedIds(id, newFailed);
+    setFailedIds(new Set(newFailed));
+    setLastSyncTime(Date.now());
+    setIsSyncing(false);
+    isSyncingRef.current = false;
+  }, []);
 
   useEffect(() => {
     params.then(({ id }) => {
@@ -323,27 +349,18 @@ export default function StudentViewPage({ params }: { params: Promise<{ id: stri
     return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); };
   }, []);
 
-  const flushPending = useCallback(async (id: string) => {
-    if (isSyncingRef.current || !navigator.onLine) return;
-    const entries = Object.entries(getPending(id));
-    if (!entries.length) return;
-    isSyncingRef.current = true;
-    setIsSyncing(true);
-    const newFailed: string[] = [];
-    for (const [recordId, changes] of entries) {
-      try {
-        await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
-        removePendingRecord(id, recordId);
-        setPending(prev => { const n = { ...prev }; delete n[recordId]; return n; });
-        setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
-      } catch { newFailed.push(recordId); }
-    }
-    saveFailedIds(id, newFailed);
-    setFailedIds(new Set(newFailed));
-    setLastSyncTime(Date.now());
-    setIsSyncing(false);
-    isSyncingRef.current = false;
-  }, []);
+  // Sync automatically when online status is restored (robust backup loop)
+  useEffect(() => {
+    if (!datasetId) return;
+    const interval = setInterval(() => {
+      if (navigator.onLine && Object.keys(pendingRef.current).length > 0) {
+        flushPending(datasetId);
+      }
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [datasetId, flushPending]);
+
+  /* ── Flush all pending to Firebase (only changed fields) ── */
 
   const syncRecord = useCallback(async (id: string, recordId: string, changes: Record<string, unknown>) => {
     if (!navigator.onLine) return;

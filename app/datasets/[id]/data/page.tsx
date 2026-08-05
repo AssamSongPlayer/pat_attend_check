@@ -381,6 +381,35 @@ export default function DataPage({ params }: { params: Promise<{ id: string }> }
   // Keep pendingRef in sync
   useEffect(() => { pendingRef.current = pending; }, [pending]);
 
+  /* ── Flush all pending to Firebase (only changed fields) ── */
+  const flushPending = useCallback(async (id: string) => {
+    if (isSyncingRef.current || !navigator.onLine) return;
+    const currentPending = getPending(id);
+    const entries = Object.entries(currentPending);
+    if (entries.length === 0) return;
+
+    isSyncingRef.current = true;
+    setIsSyncing(true);
+    const newFailed: string[] = [];
+
+    for (const [recordId, changes] of entries) {
+      try {
+        await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
+        removePendingRecord(id, recordId);
+        setPending(prev => { const n = { ...prev }; delete n[recordId]; return n; });
+        setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
+      } catch {
+        newFailed.push(recordId);
+      }
+    }
+
+    saveFailedIds(id, newFailed);
+    setFailedIds(new Set(newFailed));
+    setLastSyncTime(Date.now());
+    setIsSyncing(false);
+    isSyncingRef.current = false;
+  }, []);
+
   /* ── Init ── */
   useEffect(() => {
     params.then(({ id }) => {
@@ -418,6 +447,17 @@ export default function DataPage({ params }: { params: Promise<{ id: string }> }
       window.removeEventListener('offline', onOffline);
     };
   }, []);
+
+  // Sync automatically when online status is restored (robust backup loop)
+  useEffect(() => {
+    if (!datasetId) return;
+    const interval = setInterval(() => {
+      if (navigator.onLine && Object.keys(pendingRef.current).length > 0) {
+        flushPending(datasetId);
+      }
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [datasetId, flushPending]);
 
   /* ── Load data (called when user presses Enter) ── */
   const loadData = useCallback(async (id: string) => {
@@ -469,33 +509,6 @@ export default function DataPage({ params }: { params: Promise<{ id: string }> }
   }, [datasetId]);
 
   /* ── Flush all pending to Firebase (only changed fields) ── */
-  const flushPending = useCallback(async (id: string) => {
-    if (isSyncingRef.current || !navigator.onLine) return;
-    const currentPending = getPending(id);
-    const entries = Object.entries(currentPending);
-    if (entries.length === 0) return;
-
-    isSyncingRef.current = true;
-    setIsSyncing(true);
-    const newFailed: string[] = [];
-
-    for (const [recordId, changes] of entries) {
-      try {
-        await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
-        removePendingRecord(id, recordId);
-        setPending(prev => { const n = { ...prev }; delete n[recordId]; return n; });
-        setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
-      } catch {
-        newFailed.push(recordId);
-      }
-    }
-
-    saveFailedIds(id, newFailed);
-    setFailedIds(new Set(newFailed));
-    setLastSyncTime(Date.now());
-    setIsSyncing(false);
-    isSyncingRef.current = false;
-  }, []);
 
   /* ── Background sync for a single record ── */
   const syncRecord = useCallback(async (id: string, recordId: string, changes: Record<string, unknown>) => {
