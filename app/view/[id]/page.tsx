@@ -1,0 +1,753 @@
+'use client';
+
+import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
+import { doc, onSnapshot, collection, updateDoc, getDocs } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import type { Dataset, DataRecord } from '@/lib/types';
+import {
+  addPendingChanges, removePendingRecord, getPending,
+  getStoredRecords, saveRecordsToLS, updateStoredRecord,
+  getStoredMeta, getFailedIds, saveFailedIds,
+  type PendingMap,
+} from '@/lib/offlineSync';
+import {
+  Search, X, Loader2, ChevronLeft, ChevronRight,
+  Save, CheckCircle, ToggleLeft, Type, AlertCircle,
+  RefreshCw, WifiOff, Clock, Zap, Download,
+  Eye, ChevronDown, ChevronUp, Database, ChevronsUpDown,
+} from 'lucide-react';
+import Link from 'next/link';
+
+const PAGE_SIZE = 50;
+
+function timeAgo(ts: number) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+function highlight(text: string, q: string) {
+  if (!q) return <span>{String(text)}</span>;
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const parts = String(text).split(new RegExp(`(${escaped})`, 'gi'));
+  return (
+    <span>
+      {parts.map((p, i) =>
+        p.toLowerCase() === q.toLowerCase() ? <mark key={i}>{p}</mark> : <span key={i}>{p}</span>
+      )}
+    </span>
+  );
+}
+
+// ── Record Modal ──────────────────────────────────────────────────────────────
+function RecordModal({
+  record, dataset, isPending, isFailed, onSave, onClose,
+}: {
+  record: DataRecord; dataset: Dataset;
+  isPending: boolean; isFailed: boolean;
+  onSave: (id: string, changes: Record<string, unknown>) => void;
+  onClose: () => void;
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>(() => {
+    const init: Record<string, unknown> = {};
+    dataset.customColumns?.forEach(col => {
+      init[col.id] = record[`_custom_${col.id}`] ?? (col.type === 'boolean' ? false : '');
+    });
+    return init;
+  });
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = () => {
+    const changes: Record<string, unknown> = {};
+    dataset.customColumns?.forEach(col => {
+      changes[`_custom_${col.id}`] = values[col.id];
+    });
+    onSave(record.id, changes);
+    setSaved(true);
+    setTimeout(() => { setSaved(false); onClose(); }, 700);
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="glass-card animate-slide-up"
+        onClick={e => e.stopPropagation()}
+        style={{ width: '100%', maxWidth: 580, maxHeight: '92vh', overflowY: 'auto', padding: 0, borderRadius: '20px 20px 0 0' }}
+      >
+        {/* Drag handle */}
+        <div style={{ textAlign: 'center', padding: '10px 0 4px' }}>
+          <div style={{ width: 36, height: 4, borderRadius: 2, background: 'var(--border)', display: 'inline-block' }} />
+        </div>
+
+        {/* Header */}
+        <div style={{ padding: '8px 20px 14px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 700, fontSize: 16 }}>Record</span>
+            {isPending && <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--warning)', background: 'var(--warning-dim)', padding: '3px 8px', borderRadius: 20, fontWeight: 700 }}><Clock size={10} /> Pending</span>}
+            {isFailed && <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--danger)', background: 'var(--danger-dim)', padding: '3px 8px', borderRadius: 20, fontWeight: 700 }}><AlertCircle size={10} /> Failed</span>}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', padding: 8, borderRadius: 8, touchAction: 'manipulation' }}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div style={{ padding: '16px 20px' }}>
+          {/* Excel data */}
+          {(dataset.excelColumns || []).length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 10 }}>Data</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 8 }}>
+                {(dataset.excelColumns || []).map(col => (
+                  <div key={col} style={{ background: 'var(--bg-primary)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px' }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, marginBottom: 3, textTransform: 'uppercase' }}>{col}</div>
+                    <div style={{ fontSize: 14, wordBreak: 'break-word' }}>{String(record[col] ?? '—')}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Custom fields */}
+          {(dataset.customColumns || []).length > 0 ? (
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 12 }}>Your Fields</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                {(dataset.customColumns || []).map(col => (
+                  <div key={col.id}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                      {col.type === 'boolean' ? <ToggleLeft size={14} /> : <Type size={14} />}
+                      {col.name}
+                    </label>
+                    {col.type === 'boolean' ? (
+                      <button
+                        onClick={() => setValues(v => ({ ...v, [col.id]: !v[col.id] }))}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 12,
+                          background: values[col.id] ? 'var(--success-dim)' : 'var(--bg-primary)',
+                          border: `2px solid ${values[col.id] ? 'rgba(34,197,94,0.4)' : 'var(--border)'}`,
+                          borderRadius: 12, padding: '14px 18px', cursor: 'pointer',
+                          width: '100%', transition: 'all 0.2s', touchAction: 'manipulation',
+                        }}
+                      >
+                        <div className={`toggle ${values[col.id] ? 'on' : ''}`} />
+                        <span style={{ fontSize: 16, fontWeight: 700, color: values[col.id] ? 'var(--success)' : 'var(--text-secondary)' }}>
+                          {values[col.id] ? 'Yes' : 'No'}
+                        </span>
+                      </button>
+                    ) : (
+                      <input
+                        className="input-field"
+                        style={{ fontSize: 16, padding: '13px 14px' }}
+                        value={String(values[col.id] ?? '')}
+                        onChange={e => setValues(v => ({ ...v, [col.id]: e.target.value }))}
+                        placeholder={`Enter ${col.name}…`}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+              <button
+                className="btn-primary"
+                onClick={handleSave}
+                disabled={saved}
+                style={{ width: '100%', justifyContent: 'center', marginTop: 20, padding: '15px', fontSize: 16 }}
+              >
+                {saved ? <><CheckCircle size={18} /> Saved!</> : <><Save size={18} /> Save Changes</>}
+              </button>
+            </div>
+          ) : (
+            <div style={{ background: 'var(--accent-dim)', border: '1px solid var(--glass-border)', borderRadius: 10, padding: 16, fontSize: 14, color: 'var(--accent-hover)', textAlign: 'center' }}>
+              No custom fields configured for this dataset yet.
+            </div>
+          )}
+        </div>
+        <div style={{ height: 24 }} />
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    </div>
+  );
+}
+
+// ── Sync Pill ─────────────────────────────────────────────────────────────────
+function SyncPill({ isOnline, pendingCount, failedCount, isSyncing, lastSyncTime, lastDownloaded, onForceSync, onRefresh, isRefreshing }: {
+  isOnline: boolean; pendingCount: number; failedCount: number; isSyncing: boolean;
+  lastSyncTime: number | null; lastDownloaded: number | null;
+  onForceSync: () => void; onRefresh: () => void; isRefreshing: boolean;
+}) {
+  const total = pendingCount + failedCount;
+  let color = 'var(--success)', bg = 'rgba(34,197,94,0.1)';
+  let label = lastSyncTime ? `Synced ${timeAgo(lastSyncTime)}` : 'All synced';
+
+  if (isSyncing || isRefreshing) { color = 'var(--accent-hover)'; bg = 'var(--accent-dim)'; label = isSyncing ? 'Syncing…' : 'Refreshing…'; }
+  else if (!isOnline && total > 0) { color = 'var(--danger)'; bg = 'var(--danger-dim)'; label = `Offline · ${total} pending`; }
+  else if (!isOnline) { color = 'var(--danger)'; bg = 'var(--danger-dim)'; label = 'Offline'; }
+  else if (failedCount > 0) { color = 'var(--danger)'; bg = 'var(--danger-dim)'; label = `${failedCount} failed`; }
+  else if (pendingCount > 0) { color = 'var(--warning)'; bg = 'var(--warning-dim)'; label = `${pendingCount} pending`; }
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 16px', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', gap: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', borderRadius: 20, background: bg, border: `1px solid ${color}40` }}>
+          {(isSyncing || isRefreshing) && <Loader2 size={12} color={color} style={{ animation: 'spin 0.8s linear infinite' }} />}
+          {!isOnline && !isSyncing && <WifiOff size={12} color={color} />}
+          {isOnline && !isSyncing && !isRefreshing && total === 0 && <CheckCircle size={12} color={color} />}
+          {isOnline && !isSyncing && !isRefreshing && total > 0 && <Clock size={12} color={color} />}
+          <span style={{ fontSize: 12, fontWeight: 700, color }}>{label}</span>
+        </div>
+        {lastDownloaded && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
+            <Download size={10} /> {timeAgo(lastDownloaded)}
+          </span>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        {total > 0 && isOnline && (
+          <button className="btn-primary" onClick={onForceSync} disabled={isSyncing} style={{ padding: '6px 12px', fontSize: 12 }}>
+            <Zap size={12} /> Sync ({total})
+          </button>
+        )}
+        <button className="btn-secondary" onClick={onRefresh} disabled={isRefreshing || isSyncing} style={{ padding: '6px 12px', fontSize: 12 }}>
+          <RefreshCw size={12} style={isRefreshing ? { animation: 'spin 0.8s linear infinite' } : undefined} />
+          Refresh
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Gateway Screen ────────────────────────────────────────────────────────────
+function GatewayScreen({ dataset, onEnter, isLoading }: { dataset: Dataset | null; onEnter: () => void; isLoading: boolean }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, padding: '40px 24px', textAlign: 'center', minHeight: '60vh' }}>
+      <div style={{
+        width: 80, height: 80, borderRadius: 24,
+        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        marginBottom: 28, boxShadow: '0 20px 60px rgba(99,102,241,0.35)',
+      }}>
+        <Database size={36} color="white" />
+      </div>
+      {dataset ? (
+        <>
+          <h1 style={{ fontSize: 30, fontWeight: 800, margin: '0 0 10px', lineHeight: 1.2 }}>{dataset.name}</h1>
+          <div style={{ display: 'flex', gap: 20, justifyContent: 'center', flexWrap: 'wrap', marginBottom: 36 }}>
+            <span style={{ fontSize: 15, color: 'var(--text-secondary)' }}>
+              <strong style={{ color: 'var(--accent-hover)' }}>{dataset.rowCount?.toLocaleString()}</strong> records
+            </span>
+            {(dataset.customColumns?.length || 0) > 0 && (
+              <span style={{ fontSize: 15, color: 'var(--text-secondary)' }}>
+                <strong style={{ color: 'var(--success)' }}>{dataset.customColumns.length}</strong> custom fields
+              </span>
+            )}
+          </div>
+          <button
+            className="btn-primary"
+            onClick={onEnter}
+            disabled={isLoading}
+            style={{ padding: '17px 48px', fontSize: 18, borderRadius: 14, gap: 12, boxShadow: '0 12px 40px rgba(99,102,241,0.35)' }}
+          >
+            {isLoading
+              ? <><Loader2 size={20} style={{ animation: 'spin 0.8s linear infinite' }} /> Loading…</>
+              : <><Eye size={20} /> Enter</>
+            }
+          </button>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 16 }}>Works offline · changes sync automatically</p>
+        </>
+      ) : (
+        <Loader2 size={36} color="var(--accent-hover)" style={{ animation: 'spin 0.8s linear infinite' }} />
+      )}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+// ── Main Student View Page ────────────────────────────────────────────────────
+export default function StudentViewPage({ params }: { params: Promise<{ id: string }> }) {
+  const [datasetId, setDatasetId] = useState('');
+  const [dataset, setDataset] = useState<Dataset | null>(null);
+  const [pageState, setPageState] = useState<'gateway' | 'loading' | 'ready'>('gateway');
+  const [records, setRecords] = useState<DataRecord[]>([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [pending, setPending] = useState<PendingMap>({});
+  const [failedIds, setFailedIds] = useState<Set<string>>(new Set());
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+  const [lastSyncTime, setLastSyncTime] = useState<number | null>(null);
+  const [lastDownloaded, setLastDownloaded] = useState<number | null>(null);
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const [selectedRecord, setSelectedRecord] = useState<DataRecord | null>(null);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
+
+  // Boolean filter
+  const [boolFilterCol, setBoolFilterCol] = useState<string>('');
+  const [boolFilterVal, setBoolFilterVal] = useState<'all' | 'yes' | 'no'>('all');
+
+  // Sort
+  const [sortCol, setSortCol] = useState<string>('');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc' | null>(null);
+
+  const handleSort = (colKey: string) => {
+    if (sortCol === colKey) {
+      if (sortDir === 'asc') setSortDir('desc');
+      else { setSortCol(''); setSortDir(null); }
+    } else {
+      setSortCol(colKey);
+      setSortDir('asc');
+    }
+  };
+
+  const isSyncingRef = useRef(false);
+  const datasetIdRef = useRef('');
+
+  useEffect(() => {
+    params.then(({ id }) => {
+      setDatasetId(id);
+      datasetIdRef.current = id;
+      const dsUnsub = onSnapshot(doc(db, 'datasets', id), snap => {
+        if (snap.exists()) setDataset({ id: snap.id, ...snap.data() } as Dataset);
+      });
+      setPending(getPending(id));
+      setFailedIds(new Set(getFailedIds(id)));
+      return dsUnsub;
+    });
+  }, [params]);
+
+  useEffect(() => {
+    const onOnline = () => { setIsOnline(true); flushPending(datasetIdRef.current); };
+    const onOffline = () => setIsOnline(false);
+    setIsOnline(navigator.onLine);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); };
+  }, []);
+
+  const flushPending = useCallback(async (id: string) => {
+    if (isSyncingRef.current || !navigator.onLine) return;
+    const entries = Object.entries(getPending(id));
+    if (!entries.length) return;
+    isSyncingRef.current = true;
+    setIsSyncing(true);
+    const newFailed: string[] = [];
+    for (const [recordId, changes] of entries) {
+      try {
+        await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
+        removePendingRecord(id, recordId);
+        setPending(prev => { const n = { ...prev }; delete n[recordId]; return n; });
+        setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
+      } catch { newFailed.push(recordId); }
+    }
+    saveFailedIds(id, newFailed);
+    setFailedIds(new Set(newFailed));
+    setLastSyncTime(Date.now());
+    setIsSyncing(false);
+    isSyncingRef.current = false;
+  }, []);
+
+  const syncRecord = useCallback(async (id: string, recordId: string, changes: Record<string, unknown>) => {
+    if (!navigator.onLine) return;
+    try {
+      await updateDoc(doc(db, 'records', id, 'rows', recordId), changes);
+      const newPending = removePendingRecord(id, recordId);
+      setPending(newPending);
+      setFailedIds(prev => { const n = new Set(prev); n.delete(recordId); return n; });
+      setLastSyncTime(Date.now());
+    } catch {
+      setFailedIds(prev => new Set([...prev, recordId]));
+    }
+  }, []);
+
+  const loadData = useCallback(async (id: string) => {
+    const stored = getStoredRecords(id);
+    const meta = getStoredMeta(id);
+    if (stored && stored.length > 0) {
+      setRecords(stored);
+      setLastDownloaded(meta?.lastDownloaded ?? null);
+      setPageState('ready');
+    } else {
+      setPageState('loading');
+      try {
+        const snap = await getDocs(collection(db, 'records', id, 'rows'));
+        const fetched: DataRecord[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as DataRecord));
+        saveRecordsToLS(id, fetched);
+        setRecords(fetched);
+        setLastDownloaded(Date.now());
+        setPageState('ready');
+      } catch { setPageState('gateway'); }
+    }
+  }, []);
+
+  const handleEnter = useCallback(() => { if (datasetId) loadData(datasetId); }, [datasetId, loadData]);
+
+  const handleRefresh = useCallback(async () => {
+    const count = Object.keys(getPending(datasetId)).length;
+    if (count > 0) {
+      const ok = confirm(`${count} unsynced change(s). OK to sync first then refresh, Cancel to stay.`);
+      if (!ok) return;
+      await flushPending(datasetId);
+    }
+    setIsRefreshing(true);
+    try {
+      const snap = await getDocs(collection(db, 'records', datasetId, 'rows'));
+      const fetched = snap.docs.map(d => ({ id: d.id, ...d.data() } as DataRecord));
+      saveRecordsToLS(datasetId, fetched);
+      setRecords(fetched);
+      setLastDownloaded(Date.now());
+    } finally { setIsRefreshing(false); }
+  }, [datasetId, flushPending]);
+
+  const handleRecordSave = useCallback((recordId: string, changes: Record<string, unknown>) => {
+    const updated = updateStoredRecord(datasetId, recordId, changes);
+    setRecords(updated);
+    const newPending = addPendingChanges(datasetId, recordId, changes);
+    setPending(newPending);
+    syncRecord(datasetId, recordId, changes);
+  }, [datasetId, syncRecord]);
+
+  const booleanStats = useMemo(() => {
+    const stats: Record<string, { yes: number; no: number }> = {};
+    const cols = dataset?.customColumns || [];
+    cols.forEach(col => {
+      if (col.type === 'boolean') {
+        let yes = 0, no = 0;
+        records.forEach(r => {
+          if (r[`_custom_${col.id}`] === true) yes++;
+          else no++;
+        });
+        stats[col.id] = { yes, no };
+      }
+    });
+    return stats;
+  }, [records, dataset]);
+
+  const filtered = useMemo(() => {
+    let result = records;
+
+    // Apply boolean filter first
+    if (boolFilterCol && boolFilterVal !== 'all') {
+      result = result.filter(r => {
+        const val = r[`_custom_${boolFilterCol}`];
+        return boolFilterVal === 'yes' ? val === true : (val === false || val === undefined || val === null);
+      });
+    }
+
+    // Apply search filter
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(r => Object.values(r).some(v => String(v ?? '').toLowerCase().includes(q)));
+    }
+
+    // Apply sorting
+    if (sortCol) {
+      result = [...result].sort((a, b) => {
+        const av = a[sortCol];
+        const bv = b[sortCol];
+        
+        if (typeof av === 'boolean' || typeof bv === 'boolean') {
+          const aBool = !!av;
+          const bBool = !!bv;
+          if (aBool === bBool) return 0;
+          return sortDir === 'asc' ? (aBool ? 1 : -1) : (aBool ? -1 : 1);
+        }
+
+        const aStr = String(av ?? '').toLowerCase();
+        const bStr = String(bv ?? '').toLowerCase();
+        const cmp = aStr.localeCompare(bStr, undefined, { numeric: true });
+        return sortDir === 'asc' ? cmp : -cmp;
+      });
+    }
+
+    return result;
+  }, [records, search, boolFilterCol, boolFilterVal, sortCol, sortDir]);
+
+  const paged = useMemo(() => filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), [filtered, page]);
+  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+  const displayCols = useMemo(() => (dataset?.excelColumns ?? []).slice(0, 5), [dataset]);
+  const customCols = dataset?.customColumns ?? [];
+  const pendingCount = Object.keys(pending).length;
+  const failedCount = failedIds.size;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+        .sv-dot { width:8px; height:8px; border-radius:50%; display:inline-block; flex-shrink:0; }
+        @media (max-width: 640px) { .sv-table { display: none !important; } .sv-cards { display: flex !important; } }
+        @media (min-width: 641px) { .sv-table { display: block !important; } .sv-cards { display: none !important; } }
+      `}</style>
+
+      {/* Standalone header — NO navigation links */}
+      <header style={{
+        background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border)',
+        padding: '14px 20px', display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0,
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 10, flexShrink: 0,
+          background: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <Database size={17} color="white" />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {dataset?.name ?? '…'}
+          </div>
+          {pageState === 'ready' && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              {records.length.toLocaleString()} records
+            </div>
+          )}
+        </div>
+        {/* No navigation — intentionally empty right side */}
+      </header>
+
+      {/* Gateway */}
+      {(pageState === 'gateway' || pageState === 'loading') && (
+        <GatewayScreen dataset={dataset} onEnter={handleEnter} isLoading={pageState === 'loading'} />
+      )}
+
+      {/* Ready state */}
+      {pageState === 'ready' && (
+        <>
+          {/* Sync pill */}
+          <SyncPill
+            isOnline={isOnline} pendingCount={pendingCount} failedCount={failedCount}
+            isSyncing={isSyncing} lastSyncTime={lastSyncTime} lastDownloaded={lastDownloaded}
+            onForceSync={() => flushPending(datasetId)} onRefresh={handleRefresh} isRefreshing={isRefreshing}
+          />
+
+          {/* Search bar */}
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-secondary)', flexShrink: 0 }}>
+            <div style={{ position: 'relative' }}>
+              <Search size={17} style={{ position: 'absolute', left: 13, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', pointerEvents: 'none' }} />
+              <input
+                className="input-field"
+                style={{ paddingLeft: 42, paddingRight: 40, fontSize: 16 }}
+                placeholder={`Search ${records.length.toLocaleString()} records…`}
+                value={search}
+                onChange={e => { setSearch(e.target.value); setPage(0); }}
+              />
+              {search && (
+                <button onClick={() => { setSearch(''); setPage(0); }} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 6, touchAction: 'manipulation' }}>
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+            {search && (
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 6 }}>
+                <strong>{filtered.length.toLocaleString()}</strong> result{filtered.length !== 1 ? 's' : ''} for &ldquo;{search}&rdquo;
+              </div>
+            )}
+
+            {/* Boolean filter pills */}
+            {customCols.filter(c => c.type === 'boolean').length > 0 && (
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10, alignItems: 'center' }}>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Filter:</span>
+                {customCols.filter(c => c.type === 'boolean').map(col => {
+                  const stats = booleanStats[col.id] || { yes: 0, no: 0 };
+                  const isActiveYes = boolFilterCol === col.id && boolFilterVal === 'yes';
+                  const isActiveNo = boolFilterCol === col.id && boolFilterVal === 'no';
+                  return (
+                    <div key={col.id} style={{ display: 'flex', gap: 4, alignItems: 'center', background: 'var(--bg-primary)', padding: '2px 6px', borderRadius: 8, border: '1px solid var(--border)' }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, marginRight: 2 }}>{col.name}:</span>
+                      <button
+                        onClick={() => {
+                          if (isActiveYes) {
+                            setBoolFilterCol('');
+                            setBoolFilterVal('all');
+                          } else {
+                            setBoolFilterCol(col.id);
+                            setBoolFilterVal('yes');
+                          }
+                          setPage(0);
+                        }}
+                        className="btn-secondary"
+                        style={{
+                          padding: '2px 6px', fontSize: 11, minHeight: 'unset', height: 22, borderRadius: 4,
+                          background: isActiveYes ? 'var(--success-dim)' : 'transparent',
+                          color: isActiveYes ? 'var(--success)' : 'var(--text-secondary)',
+                          borderColor: isActiveYes ? 'var(--success)' : 'var(--border)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Yes ({stats.yes})
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (isActiveNo) {
+                            setBoolFilterCol('');
+                            setBoolFilterVal('all');
+                          } else {
+                            setBoolFilterCol(col.id);
+                            setBoolFilterVal('no');
+                          }
+                          setPage(0);
+                        }}
+                        className="btn-secondary"
+                        style={{
+                          padding: '2px 6px', fontSize: 11, minHeight: 'unset', height: 22, borderRadius: 4,
+                          background: isActiveNo ? 'var(--danger-dim)' : 'transparent',
+                          color: isActiveNo ? 'var(--danger)' : 'var(--text-secondary)',
+                          borderColor: isActiveNo ? 'var(--danger)' : 'var(--border)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        No ({stats.no})
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Content */}
+          <div style={{ flex: 1 }}>
+            {paged.length === 0 ? (
+              <div style={{ padding: 60, textAlign: 'center' }}>
+                <Search size={36} color="var(--text-muted)" style={{ margin: '0 auto 12px' }} />
+                <div style={{ fontSize: 16, fontWeight: 600 }}>No results</div>
+                <div style={{ color: 'var(--text-secondary)', fontSize: 13, marginTop: 4 }}>Try different search terms</div>
+              </div>
+            ) : (
+              <>
+                {/* Desktop table */}
+                <div className="sv-table" style={{ overflowX: 'auto' }}>
+                  <table className="data-table" style={{ minWidth: 'max-content' }}>
+                    <thead>
+                      <tr>
+                        <th style={{ width: 28, padding: '12px 6px' }} />
+                        <th style={{ width: 36 }}>#</th>
+                        {displayCols.map(c => (
+                          <th key={c} onClick={() => handleSort(c)} style={{ cursor: 'pointer' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                              {c}
+                              {sortCol === c ? (sortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />) : <ChevronsUpDown size={11} style={{ opacity: 0.4 }} />}
+                            </div>
+                          </th>
+                        ))}
+                        {customCols.map(c => {
+                          const colKey = `_custom_${c.id}`;
+                          return (
+                            <th key={c.id} onClick={() => handleSort(colKey)} style={{ cursor: 'pointer', color: 'var(--accent-hover)' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                {c.type === 'boolean' ? '⟐ ' : '✎ '}{c.name}
+                                {sortCol === colKey ? (sortDir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />) : <ChevronsUpDown size={11} style={{ opacity: 0.4 }} />}
+                              </div>
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paged.map((rec, idx) => {
+                        const rp = !!pending[rec.id], rf = failedIds.has(rec.id);
+                        return (
+                          <tr key={rec.id} onClick={() => setSelectedRecord(rec)}>
+                            <td style={{ padding: '12px 6px', textAlign: 'center' }}>
+                              <span className="sv-dot" style={{ background: rf ? 'var(--danger)' : rp ? 'var(--warning)' : 'var(--success)', opacity: rf || rp ? 1 : 0.35, animation: rp && !rf ? 'pulse 2s infinite' : undefined }} />
+                            </td>
+                            <td style={{ color: 'var(--text-muted)', fontSize: 12 }}>{page * PAGE_SIZE + idx + 1}</td>
+                            {displayCols.map(c => (
+                              <td key={c} title={String(rec[c] ?? '')}>
+                                {search ? highlight(String(rec[c] ?? ''), search) : <span>{String(rec[c] ?? '')}</span>}
+                              </td>
+                            ))}
+                            {customCols.map(c => {
+                              const val = rec[`_custom_${c.id}`];
+                              return <td key={c.id}>{c.type === 'boolean' ? <span className={`badge ${val ? 'badge-success' : ''}`} style={!val ? { background: 'var(--bg-primary)', color: 'var(--text-muted)', padding: '2px 8px' } : {}}>{val ? 'Yes' : 'No'}</span> : <span style={{ color: val ? 'var(--text-primary)' : 'var(--text-muted)' }}>{String(val || '—')}</span>}</td>;
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Mobile cards */}
+                <div className="sv-cards" style={{ flexDirection: 'column', gap: 0, display: 'none' }}>
+                  {paged.map((rec, idx) => {
+                    const rp = !!pending[rec.id], rf = failedIds.has(rec.id);
+                    const isExp = expandedRow === rec.id;
+                    return (
+                      <div key={rec.id} style={{ borderBottom: '1px solid var(--border)', background: isExp ? 'var(--bg-card)' : 'transparent' }}>
+                        <div onClick={() => setExpandedRow(isExp ? null : rec.id)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 16px', cursor: 'pointer', touchAction: 'manipulation' }}>
+                          <span className="sv-dot" style={{ background: rf ? 'var(--danger)' : rp ? 'var(--warning)' : 'var(--success)', opacity: rf || rp ? 1 : 0.35, animation: rp && !rf ? 'pulse 2s infinite' : undefined }} />
+                          <span style={{ fontSize: 12, color: 'var(--text-muted)', flexShrink: 0, width: 26 }}>{page * PAGE_SIZE + idx + 1}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {search ? highlight(String(rec[displayCols[0]] ?? '—'), search) : <span>{String(rec[displayCols[0]] ?? '—')}</span>}
+                            </div>
+                            {displayCols[1] && <div style={{ fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}>{String(rec[displayCols[1]] ?? '')}</div>}
+                          </div>
+                          {isExp ? <ChevronUp size={16} color="var(--text-muted)" /> : <ChevronDown size={16} color="var(--text-muted)" />}
+                        </div>
+                        {isExp && (
+                          <div style={{ padding: '0 16px 16px' }}>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+                              {displayCols.map(c => (
+                                <div key={c} style={{ background: 'var(--bg-primary)', borderRadius: 8, padding: '8px 10px' }}>
+                                  <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', marginBottom: 3 }}>{c}</div>
+                                  <div style={{ fontSize: 13 }}>{String(rec[c] ?? '—')}</div>
+                                </div>
+                              ))}
+                            </div>
+                            {customCols.length > 0 && (
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
+                                {customCols.map(c => {
+                                  const val = rec[`_custom_${c.id}`];
+                                  return (
+                                    <div key={c.id} style={{ background: 'var(--accent-dim)', border: '1px solid var(--glass-border)', borderRadius: 8, padding: '6px 10px' }}>
+                                      <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, marginBottom: 2 }}>{c.name}</div>
+                                      {c.type === 'boolean' ? <span style={{ fontSize: 13, fontWeight: 700, color: val ? 'var(--success)' : 'var(--text-muted)' }}>{val ? 'Yes' : 'No'}</span> : <span style={{ fontSize: 13 }}>{String(val || '—')}</span>}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            <button className="btn-primary" onClick={() => setSelectedRecord(rec)} style={{ width: '100%', justifyContent: 'center', padding: '13px' }}>
+                              Edit Fields
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Pagination + legend */}
+          <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, background: 'var(--bg-secondary)' }}>
+            <div style={{ display: 'flex', gap: 12 }}>
+              {[{ c: 'var(--success)', o: 0.35, l: 'Synced' }, { c: 'var(--warning)', o: 1, l: 'Pending' }, { c: 'var(--danger)', o: 1, l: 'Failed' }].map(d => (
+                <span key={d.l} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--text-muted)' }}>
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: d.c, opacity: d.o, display: 'inline-block' }} />{d.l}
+                </span>
+              ))}
+            </div>
+            {totalPages > 1 && (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button className="btn-secondary" style={{ padding: '7px 11px' }} disabled={page === 0} onClick={() => setPage(p => p - 1)}><ChevronLeft size={15} /></button>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>{page + 1} / {totalPages}</span>
+                <button className="btn-secondary" style={{ padding: '7px 11px' }} disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)}><ChevronRight size={15} /></button>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {selectedRecord && dataset && (
+        <RecordModal
+          record={selectedRecord} dataset={dataset}
+          isPending={!!pending[selectedRecord.id]} isFailed={failedIds.has(selectedRecord.id)}
+          onSave={handleRecordSave}
+          onClose={() => { setSelectedRecord(null); setExpandedRow(null); }}
+        />
+      )}
+    </div>
+  );
+}
